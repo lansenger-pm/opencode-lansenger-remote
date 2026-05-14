@@ -185,8 +185,21 @@ class OpenCodeClient:
         thread_id: str,
         title: str = "Lansenger remote session",
     ) -> Optional[dict]:
-        """Create an OpenCode session. HTTP mode creates a real session; CLI mode is placeholder."""
+        """Find or create an OpenCode session. 
+
+        HTTP mode: reuse the desktop app's current session for the
+        project directory first; create a new one if none exists.
+        CLI mode: placeholder.
+        """
         if self._http_available:
+            # Try to reuse existing desktop session matching current workdir
+            existing = await self._find_existing_session()
+            if existing:
+                session_id = existing["id"]
+                print(f"✅ Reusing desktop session: {session_id} (dir={existing.get('directory')})")
+                return {"sessionId": session_id, "mode": "http"}
+
+            # No matching session — create new one
             try:
                 timeout_s = self._config.request_timeout_minutes * 60
                 client = httpx.AsyncClient(timeout=timeout_s, auth=self._server_auth)
@@ -199,7 +212,7 @@ class OpenCodeClient:
                 if response.status_code in (200, 201):
                     data = response.json()
                     session_id = data.get("id", "")
-                    print(f"✅ Created OpenCode session: {session_id}")
+                    print(f"✅ Created new OpenCode session: {session_id}")
                     return {"sessionId": session_id, "mode": "http"}
                 else:
                     print(f"⚠️ HTTP session creation failed: HTTP {response.status_code}")
@@ -207,6 +220,38 @@ class OpenCodeClient:
                 print(f"⚠️ HTTP session creation error: {e}")
 
         return {"sessionId": thread_id, "mode": "cli"}
+
+    async def _find_existing_session(self) -> Optional[dict]:
+        """Find the most recently updated session matching current workdir."""
+        try:
+            client = httpx.AsyncClient(timeout=10.0, auth=self._server_auth)
+            response = await client.get(f"{self._server_url}/session")
+            await client.aclose()
+            if response.status_code != 200:
+                return None
+
+            sessions = response.json()
+            workdir = self._workdir
+
+            # Sort by last updated, find matching directory
+            matching = [
+                s for s in sessions
+                if s.get("directory") == workdir
+            ]
+            if not matching:
+                # Also try matching by path field
+                workdir_path = workdir.lstrip("/")
+                matching = [
+                    s for s in sessions
+                    if s.get("path", "").lstrip("/") == workdir_path
+                ]
+
+            if matching:
+                matching.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
+                return matching[0]
+        except Exception as e:
+            print(f"⚠️ Error finding existing session: {e}")
+        return None
 
     async def send_message(
         self,
