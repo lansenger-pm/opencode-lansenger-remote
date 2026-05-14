@@ -1,0 +1,1 @@
+"""opencode-lansenger-remote — Control OpenCode from Lansenger personal bot."""

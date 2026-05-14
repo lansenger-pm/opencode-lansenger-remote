@@ -1,0 +1,1 @@
+"""Core package — shared types, session, auth, approval, notifications."""

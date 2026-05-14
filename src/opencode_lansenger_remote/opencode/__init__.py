@@ -1,0 +1,1 @@
+"""OpenCode package — SDK client for AI coding assistant integration."""

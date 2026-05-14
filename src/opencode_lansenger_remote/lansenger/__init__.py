@@ -1,0 +1,1 @@
+"""Lansenger package — personal bot client, WS connection, message handler."""
