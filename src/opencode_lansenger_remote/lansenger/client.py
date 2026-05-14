@@ -199,6 +199,110 @@ class LansengerClient:
         """Send a brief 'thinking' message as typing indicator."""
         await self.send_text(chat_id, "⏳ 思考中... 🤔")
 
+    # ── Send file ────────────────────────────────────────────────────
+    async def send_file(
+        self, chat_id: str, file_path: str,
+        content: str = "", media_type: int = 3,
+    ) -> Optional[str]:
+        """Upload a file and send it as an attachment to a user (DM).
+
+        media_type: 1=video, 2=image, 3=file/document.
+        """
+        media_id = await self.upload_media(file_path, media_type)
+        if not media_id:
+            print(f"[Lansenger] send_file: upload failed for {file_path}")
+            return None
+
+        token = await self.get_app_token()
+        if not token:
+            return None
+
+        filename = os.path.basename(file_path)
+        filesize = os.path.getsize(file_path)
+        caption = content or filename
+
+        client = await self._ensure_http_client()
+        try:
+            url = f"{self._api_gateway_url}{API_ENDPOINTS['smart_bot']['private_message']}?app_token={token}"
+            payload = {
+                "userIdList": [chat_id],
+                "msgType": "text",
+                "msgData": {
+                    "text": {
+                        "content": caption,
+                        "attachmentList": [{
+                            "mediaId": media_id,
+                            "fileName": filename,
+                            "fileSize": filesize,
+                        }],
+                    },
+                },
+            }
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("errCode") != 0:
+                print(f"[Lansenger] send_file error: errCode={data.get('errCode')}, errMsg={data.get('errMsg')}")
+                return None
+
+            msg_id = data.get("data", {}).get("msgId")
+            print(f"[Lansenger] send_file OK: {filename} → {msg_id}")
+            return msg_id
+        except httpx.HTTPStatusError as e:
+            print(f"[Lansenger] send_file HTTP error: {e.response.status_code} — {e.response.text[:200]}")
+            return None
+        except Exception as e:
+            print(f"[Lansenger] send_file error: {type(e).__name__}: {e}")
+            return None
+
+    # ── Send appArticles ─────────────────────────────────────────────
+    async def send_app_articles(
+        self, chat_id: str, title: str, content: str,
+        author: str = "OpenCode", cover_url: str = "",
+    ) -> Optional[str]:
+        """Send appArticles (rich text card) to a user (DM).
+
+        appArticles is supported in bot private chat (4.6.12) and
+        displays as a clickable card with title + content preview.
+        """
+        token = await self.get_app_token()
+        if not token:
+            return None
+
+        client = await self._ensure_http_client()
+        try:
+            url = f"{self._api_gateway_url}{API_ENDPOINTS['smart_bot']['private_message']}?app_token={token}"
+            payload = {
+                "userIdList": [chat_id],
+                "msgType": "appArticles",
+                "msgData": {
+                    "appArticles": {
+                        "title": title,
+                        "author": author,
+                        "content": content,
+                        "coverUrl": cover_url,
+                    },
+                },
+            }
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("errCode") != 0:
+                print(f"[Lansenger] send_app_articles error: errCode={data.get('errCode')}, errMsg={data.get('errMsg')}")
+                return None
+
+            msg_id = data.get("data", {}).get("msgId")
+            print(f"[Lansenger] send_app_articles OK: {title} → {msg_id}")
+            return msg_id
+        except httpx.HTTPStatusError as e:
+            print(f"[Lansenger] send_app_articles HTTP error: {e.response.status_code} — {e.response.text[:200]}")
+            return None
+        except Exception as e:
+            print(f"[Lansenger] send_app_articles error: {type(e).__name__}: {e}")
+            return None
+
     # ── Media upload ──────────────────────────────────────────────────
     async def upload_media(self, file_path: str, media_type: int = 3) -> Optional[str]:
         """Upload a file to Lansenger. Returns mediaId or None.

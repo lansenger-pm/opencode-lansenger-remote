@@ -61,6 +61,8 @@ def list_opencode_projects() -> List[dict]:
 class OpenCodeClient:
     """Client for OpenCode — HTTP server mode (opencode serve) preferred, CLI fallback."""
 
+    _WORKDIR_FILE = os.path.expanduser("~/.opencode-lansenger-remote/workdir.json")
+
     def __init__(self, config: Config):
         self._config = config
         self._server_url = config.opencode_server_url
@@ -68,7 +70,7 @@ class OpenCodeClient:
         self._verified = False
         self._opencode_path: Optional[str] = None
         self._http_available: bool = False
-        self._workdir: str = os.getcwd()
+        self._workdir: str = self._load_persisted_workdir() or os.getcwd()
         self._server_auth: Optional[httpx.BasicAuth] = None
         # Pre-configure auth from env vars if available
         pw = os.getenv("OPENCODE_SERVER_PASSWORD", "")
@@ -222,10 +224,12 @@ class OpenCodeClient:
         return await self._send_via_cli(message)
 
     async def _send_via_http(self, session: dict, message: str) -> Optional[str]:
-        """Send prompt via OpenCode HTTP server API.
+        """Send prompt via OpenCode HTTP server API, then fetch full response.
 
-        Uses POST /session/:id/message with parts format per OpenCode SDK spec.
-        Response format: { info: Message, parts: Part[] }
+        OpenCode returns multi-step responses: the POST returns only the first
+        assistant step, but the full analysis is in subsequent messages.
+        We need to: (1) send prompt, (2) wait for completion, (3) fetch all
+        assistant text parts from the message list.
         """
         session_id = session.get("sessionId", "")
         timeout_s = self._config.request_timeout_minutes * 60
@@ -233,41 +237,115 @@ class OpenCodeClient:
         try:
             client = httpx.AsyncClient(timeout=timeout_s, auth=self._server_auth)
             try:
+                # Record current message count before sending
+                pre_count = await self._get_message_count(client, session_id)
+
+                # Send prompt
                 response = await client.post(
                     f"{self._server_url}/session/{session_id}/message",
-                    json={
-                        "parts": [{"type": "text", "text": message}],
-                    },
+                    json={"parts": [{"type": "text", "text": message}]},
                     timeout=timeout_s,
                 )
 
-                if response.status_code in (200, 201):
-                    data = response.json()
-
-                    # Extract text from parts array
-                    parts = data.get("parts", [])
-                    text_parts = [
-                        p.get("text", "") for p in parts
-                        if p.get("type") == "text" and p.get("text")
-                    ]
-
-                    # Also check info.content as fallback
-                    info_text = data.get("info", {}).get("content", "")
-
-                    response_text = "\n".join(text_parts) if text_parts else info_text
-
+                if response.status_code not in (200, 201):
+                    error_body = response.text[:200]
+                    print(f"⚠️ HTTP message error: HTTP {response.status_code} — {error_body}")
                     await client.aclose()
-                    return response_text or "我收到了你的消息但没有回复内容。"
+                    return None
 
-                error_body = response.text[:200]
-                print(f"⚠️ HTTP message error: HTTP {response.status_code} — {error_body}")
+                # Wait for OpenCode to finish processing (poll message list)
+                full_text = await self._poll_for_completion(client, session_id, pre_count, timeout_s)
+
                 await client.aclose()
+                return full_text or "我收到了你的消息但没有回复内容。"
+
             except httpx.TimeoutException:
                 await client.aclose()
                 return "⏱️ OpenCode 响应超时。任务可能仍在运行。"
             except Exception as e:
                 print(f"⚠️ HTTP message error: {e}")
                 await client.aclose()
+        except Exception:
+            pass
+
+        return None
+
+    async def _get_message_count(self, client: httpx.AsyncClient, session_id: str) -> int:
+        """Get current message count for a session."""
+        try:
+            response = await client.get(f"{self._server_url}/session/{session_id}/message")
+            if response.status_code == 200:
+                return len(response.json())
+        except Exception:
+            pass
+        return 0
+
+    async def _poll_for_completion(
+        self, client: httpx.AsyncClient, session_id: str,
+        pre_count: int, timeout_s: int,
+    ) -> Optional[str]:
+        """Poll message list until OpenCode finishes, then extract all text."""
+        poll_interval = 2
+        elapsed = 0
+
+        while elapsed < timeout_s:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            try:
+                response = await client.get(f"{self._server_url}/session/{session_id}/message")
+                if response.status_code != 200:
+                    continue
+
+                messages = response.json()
+                if len(messages) <= pre_count:
+                    continue
+
+                # Check if the last assistant message has completed
+                # (info.time.completed exists means it's done)
+                new_messages = messages[pre_count:]
+                last_assistant = None
+                all_text_parts = []
+
+                for msg in new_messages:
+                    info = msg.get("info", {})
+                    if info.get("role") != "assistant":
+                        continue
+                    last_assistant = msg
+
+                    # Extract text parts from this message
+                    for part in msg.get("parts", []):
+                        if part.get("type") == "text" and part.get("text"):
+                            all_text_parts.append(part["text"])
+
+                if not last_assistant:
+                    continue
+
+                # Check if completed
+                time_info = last_assistant.get("info", {}).get("time", {})
+                if time_info.get("completed"):
+                    print(f"✅ OpenCode completed after {elapsed}s, {len(all_text_parts)} text parts")
+                    return "\n\n".join(all_text_parts) if all_text_parts else None
+
+            except Exception as e:
+                print(f"⚠️ Poll error: {e}")
+                continue
+
+        # Timeout — extract whatever text we have
+        try:
+            response = await client.get(f"{self._server_url}/session/{session_id}/message")
+            if response.status_code == 200:
+                messages = response.json()
+                new_messages = messages[pre_count:]
+                all_text_parts = []
+                for msg in new_messages:
+                    if msg.get("info", {}).get("role") != "assistant":
+                        continue
+                    for part in msg.get("parts", []):
+                        if part.get("type") == "text" and part.get("text"):
+                            all_text_parts.append(part["text"])
+                if all_text_parts:
+                    return "\n\n".join(all_text_parts)
         except Exception:
             pass
 
@@ -315,8 +393,32 @@ class OpenCodeClient:
         return self._workdir
 
     def set_workdir(self, path: str) -> None:
-        """Set working directory for OpenCode CLI mode."""
+        """Set working directory for OpenCode and persist it."""
         self._workdir = os.path.abspath(path)
+        self._persist_workdir()
+
+    def _load_persisted_workdir(self) -> Optional[str]:
+        """Load persisted workdir from file."""
+        try:
+            if os.path.exists(self._WORKDIR_FILE):
+                data = json.loads(open(self._WORKDIR_FILE).read())
+                workdir = data.get("workdir", "")
+                if workdir and os.path.isdir(workdir):
+                    print(f"✅ Loaded persisted workdir: {workdir}")
+                    return workdir
+        except Exception:
+            pass
+        return None
+
+    def _persist_workdir(self) -> None:
+        """Persist current workdir to file."""
+        try:
+            os.makedirs(os.path.dirname(self._WORKDIR_FILE), exist_ok=True)
+            with open(self._WORKDIR_FILE, "w") as f:
+                json.dump({"workdir": self._workdir}, f)
+            os.chmod(self._WORKDIR_FILE, 0o600)
+        except Exception as e:
+            print(f"⚠️ Failed to persist workdir: {e}")
 
     async def get_project_info(self) -> Optional[dict]:
         """Get project info from HTTP server (if available)."""

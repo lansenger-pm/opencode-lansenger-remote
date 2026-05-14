@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 import time
 from typing import Optional, Any
 
@@ -212,16 +214,15 @@ class LansengerBot:
             self._opencode_sessions[ctx.thread_id] = opencode_session
             session.opencode_session_id = opencode_session.get("sessionId")
 
-        # Send to OpenCode
+        # Send to OpenCode — progressive push in HTTP mode
         try:
-            response = await self._opencode.send_message(
-                opencode_session, text
-            )
-
-            # Split long response
-            messages = split_message(response)
-            for msg in messages:
-                await self._reply(ctx.thread_id, msg)
+            if opencode_session.get("mode") == "http" and self._opencode._http_available:
+                await self._stream_opencode_response(ctx.thread_id, opencode_session, text)
+            else:
+                response = await self._opencode.send_message(opencode_session, text)
+                messages = split_message(response)
+                for msg in messages:
+                    await self._reply(ctx.thread_id, msg)
         except Exception as e:
             await self._reply(ctx.thread_id, task_failed(str(e)))
 
@@ -415,11 +416,163 @@ class LansengerBot:
         cwd = self._opencode.current_workdir()
         await self._reply(ctx.thread_id, f"📁 `{cwd}`")
 
+    # ── Progressive push (no streaming) ────────────────────────────────
+    async def _stream_opencode_response(
+        self, chat_id: str, opencode_session: dict, prompt: str,
+    ) -> None:
+        """Send prompt to OpenCode, poll for new completed text parts,
+        push each to Lansenger immediately as separate messages.
+
+        Lansenger does not support streaming, so we do progressive push:
+        each completed assistant text part is sent as its own message
+        as soon as it's ready, rather than waiting for everything.
+        """
+        session_id = opencode_session.get("sessionId", "")
+        server_url = self._opencode._server_url
+        auth = self._opencode._server_auth
+        timeout_s = self._config.request_timeout_minutes * 60
+
+        client = httpx.AsyncClient(timeout=timeout_s, auth=auth)
+        try:
+            # Record current message count before sending
+            pre_count = await self._opencode._get_message_count(client, session_id)
+
+            # Send prompt
+            response = await client.post(
+                f"{server_url}/session/{session_id}/message",
+                json={"parts": [{"type": "text", "text": prompt}]},
+                timeout=timeout_s,
+            )
+            if response.status_code not in (200, 201):
+                error_body = response.text[:200]
+                await self._reply(chat_id, f"❌ OpenCode 错误: HTTP {response.status_code}")
+                return
+
+            # Poll — push each completed text part as it appears
+            sent_indices: set[int] = set()
+            poll_interval = 2
+            elapsed = 0
+
+            while elapsed < timeout_s:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+                try:
+                    resp = await client.get(f"{server_url}/session/{session_id}/message")
+                    if resp.status_code != 200:
+                        continue
+
+                    messages = resp.json()
+                    if len(messages) <= pre_count:
+                        continue
+
+                    new_messages = messages[pre_count:]
+                    all_done = False
+
+                    for idx, msg in enumerate(new_messages):
+                        if idx in sent_indices:
+                            continue
+                        info = msg.get("info", {})
+                        if info.get("role") != "assistant":
+                            continue
+
+                        # Only push if this message has completed
+                        time_info = info.get("time", {})
+                        if not time_info.get("completed"):
+                            continue
+
+                        # Extract text parts from this completed message
+                        text_parts = []
+                        for part in msg.get("parts", []):
+                            if part.get("type") == "text" and part.get("text"):
+                                text_parts.append(part["text"])
+
+                        if text_parts:
+                            for text in text_parts:
+                                for chunk in split_message(text):
+                                    await self._reply(chat_id, chunk)
+                            sent_indices.add(idx)
+
+                        # If this is the last new assistant message and it's completed, we're done
+                        if idx == len(new_messages) - 1:
+                            all_done = True
+
+                    if all_done and len(sent_indices) >= len(
+                        [m for m in new_messages if m.get("info", {}).get("role") == "assistant"]
+                    ):
+                        print(f"✅ Progressive push done: {elapsed}s, {len(sent_indices)} parts sent")
+                        return
+
+                except Exception as e:
+                    print(f"⚠️ Poll error: {e}")
+                    continue
+
+            # Timeout — push whatever we haven't sent yet
+            try:
+                resp = await client.get(f"{server_url}/session/{session_id}/message")
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    new_messages = messages[pre_count:]
+                    for idx, msg in enumerate(new_messages):
+                        if idx in sent_indices:
+                            continue
+                        if msg.get("info", {}).get("role") != "assistant":
+                            continue
+                        for part in msg.get("parts", []):
+                            if part.get("type") == "text" and part.get("text"):
+                                for chunk in split_message(part["text"]):
+                                    await self._reply(chat_id, chunk)
+                        sent_indices.add(idx)
+            except Exception:
+                pass
+
+            if not sent_indices:
+                await self._reply(chat_id, "⏱️ OpenCode 响应超时，未收到回复。")
+
+        except httpx.TimeoutException:
+            await self._reply(chat_id, "⏱️ OpenCode 响应超时。任务可能仍在运行。")
+        except Exception as e:
+            print(f"⚠️ Progressive push error: {e}")
+            await self._reply(chat_id, f"❌ 错误: {e}")
+        finally:
+            await client.aclose()
+
     # ── Reply helper ──────────────────────────────────────────────────
     async def _reply(self, chat_id: str, text: str) -> Optional[str]:
-        """Send a reply using formatText (Markdown) if content has formatting,
-        otherwise plain text."""
+        """Send a reply to Lansenger.
+
+        Strategy:
+        - ≤ 6000 chars: send as text or formatText (Markdown) message
+        - > 6000 chars: write to temp .md file and send as file attachment
+        """
+        if len(text) > 6000:
+            return await self._reply_as_file(chat_id, text)
+
         # Use formatText for content with Markdown indicators
         if any(marker in text for marker in ["**", "```", "•", "—", "##", "|"]):
             return await self._http_client.send_format_text(chat_id, text)
         return await self._http_client.send_text(chat_id, text)
+
+    async def _reply_as_file(self, chat_id: str, text: str) -> Optional[str]:
+        """Write text to a temp .md file and send as file attachment."""
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="opencode-lx-")
+            filename = f"opencode-response.md"
+            filepath = os.path.join(tmp_dir, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(text)
+            result = await self._http_client.send_file(
+                chat_id, filepath, content=f"📄 响应内容过长({len(text)}字)，已生成文件"
+            )
+            # Cleanup temp file
+            try:
+                os.unlink(filepath)
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+            return result
+        except Exception as e:
+            print(f"[Lansenger] _reply_as_file error: {e}")
+            # Fallback: send truncated text
+            truncated = text[:5900] + "\n\n... (内容过长，已截断)"
+            return await self._http_client.send_format_text(chat_id, truncated)
