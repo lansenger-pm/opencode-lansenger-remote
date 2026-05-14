@@ -28,7 +28,7 @@ def _find_opencode_db() -> Optional[str]:
 
 
 def list_opencode_projects() -> List[dict]:
-    """List projects from OpenCode database, sorted by last used."""
+    """List projects from OpenCode database, sorted by last session activity (up to 9)."""
     db_path = _find_opencode_db()
     if not db_path:
         return []
@@ -36,9 +36,18 @@ def list_opencode_projects() -> List[dict]:
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
+
         rows = conn.execute(
-            "SELECT id, worktree, name, icon_color, time_updated FROM project "
-            "WHERE id != 'global' ORDER BY time_updated DESC"
+            "SELECT p.id, p.worktree, p.name, p.icon_color, "
+            "COALESCE(s.last_used, p.time_updated) as sort_time "
+            "FROM project p "
+            "LEFT JOIN ("
+            "  SELECT project_id, MAX(time_updated) as last_used "
+            "  FROM session GROUP BY project_id"
+            ") s ON s.project_id = p.id "
+            "WHERE p.id != 'global' "
+            "ORDER BY sort_time DESC "
+            "LIMIT 9"
         ).fetchall()
         conn.close()
 
