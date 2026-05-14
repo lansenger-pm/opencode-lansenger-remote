@@ -9,6 +9,8 @@ import tempfile
 import time
 from typing import Optional, Any
 
+import httpx
+
 from ..core.types import Config, MessageContext, EMOJI
 from ..core.session import get_or_create_session, init_session_manager
 from ..core.auth import isAuthorized, has_owner, claim_ownership, get_owner
@@ -214,10 +216,14 @@ class LansengerBot:
             self._opencode_sessions[ctx.thread_id] = opencode_session
             session.opencode_session_id = opencode_session.get("sessionId")
 
+        # Inject project context into prompt so AI knows the workdir
+        workdir = self._opencode.current_workdir()
+        enriched_text = f"[项目目录: {workdir}]\n\n{text}" if workdir else text
+
         # Send to OpenCode — progressive push in HTTP mode
         try:
             if opencode_session.get("mode") == "http" and self._opencode._http_available:
-                await self._stream_opencode_response(ctx.thread_id, opencode_session, text)
+                await self._stream_opencode_response(ctx.thread_id, opencode_session, enriched_text)
             else:
                 response = await self._opencode.send_message(opencode_session, text)
                 messages = split_message(response)
@@ -235,6 +241,7 @@ class LansengerBot:
             "/start": self._cmd_start,
             "/help": self._cmd_help,
             "/status": self._cmd_status,
+            "/join": self._cmd_join,
             "/approve": self._cmd_approve,
             "/reject": self._cmd_reject,
             "/diff": self._cmd_diff,
@@ -275,7 +282,8 @@ class LansengerBot:
 /project — 查看当前项目信息
 /pwd — 查看当前工作目录
 /cd <路径或编号> — 切换项目目录（如 /cd 1 或 /cd ~/my-project）
-/reset — 重置会话
+/join — 加入桌面版当前 session（消息在桌面版可见）
+/reset — 重置会话（退回独立 session）
 /approve — 批准待审批变更
 /reject — 拒绝变更
 /diff — 查看变更详情
@@ -415,6 +423,23 @@ class LansengerBot:
         """Show current working directory."""
         cwd = self._opencode.current_workdir()
         await self._reply(ctx.thread_id, f"📁 `{cwd}`")
+
+    async def _cmd_join(self, ctx: MessageContext, session: Any, raw_text: str = "") -> None:
+        """Join desktop app's current session so messages appear in desktop UI."""
+        if not await self._opencode.check_connection():
+            await self._reply(ctx.thread_id, opencode_offline())
+            return
+
+        desktop_session = await self._opencode.join_desktop_session()
+        if not desktop_session:
+            await self._reply(ctx.thread_id, "❌ 未找到当前项目的桌面版会话\n\n请先在 OpenCode 桌面版中打开此项目。")
+            return
+
+        session_id = desktop_session.get("sessionId", "")
+        self._opencode_sessions[ctx.thread_id] = desktop_session
+        session.opencode_session_id = session_id
+        cancel_all_approvals(session)
+        await self._reply(ctx.thread_id, f"✅ 已加入桌面版会话\n\n🆔 `{session_id[:20]}...`\n\n💡 你在蓝信发的消息将在桌面版 chat 中可见，桌面版的回复也会推送到蓝信。")
 
     # ── Progressive push (no streaming) ────────────────────────────────
     async def _stream_opencode_response(

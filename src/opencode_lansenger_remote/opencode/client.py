@@ -28,7 +28,12 @@ def _find_opencode_db() -> Optional[str]:
 
 
 def list_opencode_projects() -> List[dict]:
-    """List projects from OpenCode database, sorted by last session activity (up to 9)."""
+    """List projects from OpenCode, sorted by last session activity (up to 9).
+
+    Combines two sources:
+    1. project table — registered projects with worktree
+    2. session table — directories used with project_id='global' (not in project table)
+    """
     db_path = _find_opencode_db()
     if not db_path:
         return []
@@ -38,29 +43,23 @@ def list_opencode_projects() -> List[dict]:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute(
-            "SELECT p.id, p.worktree, p.name, p.icon_color, "
-            "COALESCE(s.last_used, p.time_updated) as sort_time "
-            "FROM project p "
-            "LEFT JOIN ("
-            "  SELECT project_id, MAX(time_updated) as last_used "
-            "  FROM session GROUP BY project_id"
-            ") s ON s.project_id = p.id "
-            "WHERE p.id != 'global' "
-            "ORDER BY sort_time DESC "
+            "SELECT directory as path, MAX(time_updated) as last_used "
+            "FROM session "
+            "GROUP BY directory "
+            "ORDER BY last_used DESC "
             "LIMIT 9"
         ).fetchall()
         conn.close()
 
         results = []
         for row in rows:
-            worktree = row["worktree"]
-            dirname = os.path.basename(worktree) if worktree else "?"
-            name = row["name"] or dirname
+            path = row["path"]
+            dirname = os.path.basename(path) if path else "?"
             results.append({
-                "id": row["id"],
-                "path": worktree,
-                "name": name,
-                "icon_color": row["icon_color"] or "orange",
+                "id": "",
+                "path": path,
+                "name": dirname,
+                "icon_color": "orange",
             })
         return results
     except Exception:
@@ -194,21 +193,24 @@ class OpenCodeClient:
         thread_id: str,
         title: str = "Lansenger remote session",
     ) -> Optional[dict]:
-        """Find or create an OpenCode session. 
+        """Create a new OpenCode session, or reuse an existing one for the workdir.
 
-        HTTP mode: reuse the desktop app's current session for the
-        project directory first; create a new one if none exists.
-        CLI mode: placeholder.
+        Strategy:
+        1. Find existing sessions matching our workdir directory
+        2. Pick one that's NOT the most-recently-updated (avoid desktop active session)
+        3. If all matching sessions are the desktop's active one, create new
+        4. New sessions unfortunately land under the "global" project (home dir)
+           because OpenCode API doesn't support directory parameter
         """
         if self._http_available:
-            # Try to reuse existing desktop session matching current workdir
-            existing = await self._find_existing_session()
-            if existing:
-                session_id = existing["id"]
-                print(f"✅ Reusing desktop session: {session_id} (dir={existing.get('directory')})")
+            # Try to reuse an existing session (not desktop's active one)
+            reuse = await self._find_reusable_session()
+            if reuse:
+                session_id = reuse["id"]
+                print(f"✅ Reusing existing session: {session_id} (dir={reuse.get('directory')})")
                 return {"sessionId": session_id, "mode": "http"}
 
-            # No matching session — create new one
+            # No reusable session — create new one
             try:
                 timeout_s = self._config.request_timeout_minutes * 60
                 client = httpx.AsyncClient(timeout=timeout_s, auth=self._server_auth)
@@ -229,6 +231,38 @@ class OpenCodeClient:
                 print(f"⚠️ HTTP session creation error: {e}")
 
         return {"sessionId": thread_id, "mode": "cli"}
+
+    async def _find_reusable_session(self) -> Optional[dict]:
+        """Find an existing session for our workdir that's NOT the desktop's most active one."""
+        try:
+            client = httpx.AsyncClient(timeout=10.0, auth=self._server_auth)
+            response = await client.get(f"{self._server_url}/session")
+            await client.aclose()
+            if response.status_code != 200:
+                return None
+
+            sessions = response.json()
+            workdir = self._workdir
+
+            matching = [
+                s for s in sessions
+                if s.get("directory") == workdir
+            ]
+            if not matching:
+                return None
+
+            # Sort by last updated
+            matching.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
+
+            # If there are multiple sessions, pick the second one (avoid desktop's active)
+            if len(matching) > 1:
+                return matching[1]
+
+            # Only one session exists (probably desktop's active) — don't reuse to avoid conflict
+            return None
+        except Exception as e:
+            print(f"⚠️ Error finding reusable session: {e}")
+        return None
 
     async def _find_existing_session(self) -> Optional[dict]:
         """Find the most recently updated session matching current workdir."""
@@ -322,6 +356,45 @@ class OpenCodeClient:
         except Exception:
             pass
 
+        return None
+
+    async def join_desktop_session(self) -> Optional[dict]:
+        """Find and reuse the desktop app's most active session for the workdir."""
+        existing = await self._find_existing_session()
+        if existing:
+            session_id = existing["id"]
+            print(f"✅ Joined desktop session: {session_id} (dir={existing.get('directory')})")
+            return {"sessionId": session_id, "mode": "http"}
+        return None
+
+    async def _find_existing_session(self) -> Optional[dict]:
+        """Find the most recently updated session matching current workdir."""
+        try:
+            client = httpx.AsyncClient(timeout=10.0, auth=self._server_auth)
+            response = await client.get(f"{self._server_url}/session")
+            await client.aclose()
+            if response.status_code != 200:
+                return None
+
+            sessions = response.json()
+            workdir = self._workdir
+
+            matching = [
+                s for s in sessions
+                if s.get("directory") == workdir
+            ]
+            if not matching:
+                workdir_path = workdir.lstrip("/")
+                matching = [
+                    s for s in sessions
+                    if s.get("path", "").lstrip("/") == workdir_path
+                ]
+
+            if matching:
+                matching.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
+                return matching[0]
+        except Exception as e:
+            print(f"⚠️ Error finding existing session: {e}")
         return None
 
     async def _get_message_count(self, client: httpx.AsyncClient, session_id: str) -> int:
