@@ -204,7 +204,11 @@ class LansengerClient:
         self, chat_id: str, file_path: str,
         content: str = "", media_type: int = 3,
     ) -> Optional[str]:
-        """Upload a file and send it as an attachment to a user (DM).
+        """Upload a file and send it as a media attachment to a user (DM).
+
+        Uses msgType='text' with mediaIds + mediaType fields
+        (same approach as Hermes adapter). Note: Markdown is NOT
+        supported when sending media; use plain text for caption.
 
         media_type: 1=video, 2=image, 3=file/document.
         """
@@ -217,9 +221,7 @@ class LansengerClient:
         if not token:
             return None
 
-        filename = os.path.basename(file_path)
-        filesize = os.path.getsize(file_path)
-        caption = content or filename
+        caption = content or os.path.basename(file_path)
 
         client = await self._ensure_http_client()
         try:
@@ -230,11 +232,8 @@ class LansengerClient:
                 "msgData": {
                     "text": {
                         "content": caption,
-                        "attachmentList": [{
-                            "mediaId": media_id,
-                            "fileName": filename,
-                            "fileSize": filesize,
-                        }],
+                        "mediaType": media_type,
+                        "mediaIds": [media_id],
                     },
                 },
             }
@@ -247,7 +246,7 @@ class LansengerClient:
                 return None
 
             msg_id = data.get("data", {}).get("msgId")
-            print(f"[Lansenger] send_file OK: {filename} → {msg_id}")
+            print(f"[Lansenger] send_file OK: {os.path.basename(file_path)} → {msg_id}")
             return msg_id
         except httpx.HTTPStatusError as e:
             print(f"[Lansenger] send_file HTTP error: {e.response.status_code} — {e.response.text[:200]}")

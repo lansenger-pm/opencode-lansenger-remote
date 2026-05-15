@@ -7,6 +7,8 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Any
 
 import httpx
@@ -54,6 +56,10 @@ class LansengerBot:
         self._seen_msg_ids: dict[str, bool] = {}
         # Project list cache for /projects + /cd <number>
         self._project_list: list = []
+
+        # Conversation log directory
+        self._log_dir = Path.home() / ".opencode-lansenger-remote" / "conversations"
+        self._log_dir.mkdir(parents=True, exist_ok=True)
 
     async def start(self) -> None:
         """Initialize everything and start the bot."""
@@ -167,6 +173,9 @@ class LansengerBot:
             user_id=sender_id,
             message_id=msg_id,
         )
+
+        # Log inbound message
+        self._log_message(chat_id, "inbound", text, "user")
 
         print(f"[Lansenger] 收到消息: {text[:50]} (from={sender_id}, id={msg_id[:16]})")
 
@@ -441,41 +450,170 @@ class LansengerBot:
         cancel_all_approvals(session)
         await self._reply(ctx.thread_id, f"✅ 已加入桌面版会话\n\n🆔 `{session_id[:20]}...`\n\n💡 你在蓝信发的消息将在桌面版 chat 中可见，桌面版的回复也会推送到蓝信。")
 
-    # ── Progressive push (no streaming) ────────────────────────────────
+    # ── Progressive push via SSE + prompt_async ─────────────────────────
     async def _stream_opencode_response(
         self, chat_id: str, opencode_session: dict, prompt: str,
     ) -> None:
-        """Send prompt to OpenCode, poll for new completed text parts,
-        push each to Lansenger immediately as separate messages.
+        """Send prompt to OpenCode via prompt_async (returns immediately),
+        subscribe to SSE event stream for real-time message.part.delta events,
+        and push each completed step's text to Lansenger as it finishes.
 
-        Lansenger does not support streaming, so we do progressive push:
-        each completed assistant text part is sent as its own message
-        as soon as it's ready, rather than waiting for everything.
+        Uses the OpenCode Server API:
+        - POST /session/:id/prompt_async — send prompt, 204 No Content
+        - GET /event — SSE stream with message.part.delta, session.idle events
+
+        When a new messageID appears in delta events, the previous step
+        is complete — push its accumulated text. On session.idle, push
+        any remaining text. Falls back to polling if SSE fails.
         """
         session_id = opencode_session.get("sessionId", "")
         server_url = self._opencode._server_url
         auth = self._opencode._server_auth
         timeout_s = self._config.request_timeout_minutes * 60
 
+        try:
+            # Try SSE-based approach first
+            await self._sse_push(chat_id, server_url, auth, session_id, prompt, timeout_s)
+        except Exception as e:
+            print(f"[Stream] SSE failed ({e}), falling back to polling")
+            try:
+                await self._poll_push(chat_id, server_url, auth, session_id, prompt, timeout_s)
+            except Exception as e2:
+                print(f"[Stream] Poll push error: {e2}")
+                await self._reply(chat_id, f"❌ 错误: {e2}")
+
+    async def _sse_push(
+        self, chat_id: str, server_url: str,
+        auth: Optional[httpx.BasicAuth], session_id: str,
+        prompt: str, timeout_s: int,
+    ) -> None:
+        """SSE-based progressive push: prompt_async + event stream."""
+        client = httpx.AsyncClient(timeout=timeout_s, auth=auth)
+
+        # 1. Connect to SSE stream FIRST (so we see all events from the prompt)
+        accumulated: dict[str, str] = {}  # messageID → accumulated text
+        last_msg_id: Optional[str] = None
+        done = asyncio.Event()
+        error_msg: Optional[str] = None
+
+        async def on_sse_line(line: str) -> None:
+            if not line.startswith("data:"):
+                return
+            raw = line[5:].strip()
+            if not raw:
+                return
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return
+
+            event_type = data.get("type", "")
+            props = data.get("properties", {})
+
+            if props.get("sessionID") != session_id:
+                return
+
+            if event_type == "message.part.delta":
+                msg_id = props.get("messageID", "")
+                part_id = props.get("partID", "")
+                field = props.get("field", "")
+                delta = props.get("delta", "")
+
+                if field == "text" and delta:
+                    if msg_id not in accumulated:
+                        # New step started — push previous step's text if any
+                        if last_msg_id and last_msg_id in accumulated:
+                            prev_text = accumulated.pop(last_msg_id)
+                            if prev_text:
+                                for chunk in split_message(prev_text):
+                                    await self._reply(chat_id, chunk)
+                        last_msg_id = msg_id
+                    accumulated[msg_id] = accumulated.get(msg_id, "") + delta
+
+            elif event_type == "session.idle":
+                # Session finished — push all remaining accumulated text
+                for msg_id, text in accumulated.items():
+                    if text:
+                        for chunk in split_message(text):
+                            await self._reply(chat_id, chunk)
+                accumulated.clear()
+                done.set()
+
+        # 2. Send prompt via prompt_async (returns 204 immediately)
+        try:
+            resp = await client.post(
+                f"{server_url}/session/{session_id}/prompt_async",
+                json={"parts": [{"type": "text", "text": prompt}]},
+                timeout=30,
+            )
+            if resp.status_code != 204:
+                error_msg = f"❌ OpenCode prompt_async: HTTP {resp.status_code}"
+                done.set()
+                return
+            print(f"[SSE] prompt_async OK, listening for deltas...")
+        except Exception as e:
+            error_msg = f"❌ OpenCode 错误: {e}"
+            done.set()
+            return
+
+        # 3. Read SSE stream until session.idle or timeout
+        try:
+            async with client.stream("GET", f"{server_url}/event") as response:
+                if response.status_code != 200:
+                    raise RuntimeError(f"SSE stream HTTP {response.status_code}")
+
+                async with asyncio.timeout(timeout_s):
+                    async for line in response.aiter_lines():
+                        await on_sse_line(line)
+                        if done.is_set():
+                            break
+        except asyncio.TimeoutError:
+            # Timeout — push whatever we have and fetch remaining via polling
+            print(f"[SSE] Timeout after {timeout_s}s, pushing accumulated")
+            for msg_id, text in accumulated.items():
+                if text:
+                    for chunk in split_message(text):
+                        await self._reply(chat_id, chunk)
+            accumulated.clear()
+            # Final fetch to get any missed completed messages
+            await self._final_fetch(client, server_url, session_id, chat_id)
+        except Exception as e:
+            if not done.is_set():
+                print(f"[SSE] Stream error: {e}")
+                for msg_id, text in accumulated.items():
+                    if text:
+                        for chunk in split_message(text):
+                            await self._reply(chat_id, chunk)
+                accumulated.clear()
+                await self._final_fetch(client, server_url, session_id, chat_id)
+
+        if error_msg:
+            await self._reply(chat_id, error_msg)
+
+        await client.aclose()
+
+    async def _poll_push(
+        self, chat_id: str, server_url: str,
+        auth: Optional[httpx.BasicAuth], session_id: str,
+        prompt: str, timeout_s: int,
+    ) -> None:
+        """Fallback polling-based push (original approach with delays)."""
         client = httpx.AsyncClient(timeout=timeout_s, auth=auth)
         try:
-            # Record current message count before sending
             pre_count = await self._opencode._get_message_count(client, session_id)
 
-            # Send prompt
             response = await client.post(
                 f"{server_url}/session/{session_id}/message",
                 json={"parts": [{"type": "text", "text": prompt}]},
                 timeout=timeout_s,
             )
             if response.status_code not in (200, 201):
-                error_body = response.text[:200]
                 await self._reply(chat_id, f"❌ OpenCode 错误: HTTP {response.status_code}")
                 return
 
-            # Poll — push each completed text part as it appears
             sent_indices: set[int] = set()
-            poll_interval = 2
+            poll_interval = 0.5
+            send_delay = 0.8
             elapsed = 0
 
             while elapsed < timeout_s:
@@ -493,6 +631,7 @@ class LansengerBot:
 
                     new_messages = messages[pre_count:]
                     all_done = False
+                    newly_sent = 0
 
                     for idx, msg in enumerate(new_messages):
                         if idx in sent_indices:
@@ -501,66 +640,66 @@ class LansengerBot:
                         if info.get("role") != "assistant":
                             continue
 
-                        # Only push if this message has completed
                         time_info = info.get("time", {})
-                        if not time_info.get("completed"):
+                        is_completed = bool(time_info.get("completed"))
+                        if not is_completed:
                             continue
 
-                        # Extract text parts from this completed message
                         text_parts = []
                         for part in msg.get("parts", []):
                             if part.get("type") == "text" and part.get("text"):
                                 text_parts.append(part["text"])
+                        curr_text = "\n\n".join(text_parts) if text_parts else ""
 
-                        if text_parts:
-                            for text in text_parts:
-                                for chunk in split_message(text):
-                                    await self._reply(chat_id, chunk)
-                            sent_indices.add(idx)
+                        if curr_text:
+                            if newly_sent > 0:
+                                await asyncio.sleep(send_delay)
+                            for chunk in split_message(curr_text):
+                                await self._reply(chat_id, chunk)
+                        sent_indices.add(idx)
+                        newly_sent += 1
 
-                        # If this is the last new assistant message and it's completed, we're done
-                        if idx == len(new_messages) - 1:
+                        if idx == len(new_messages) - 1 and is_completed:
                             all_done = True
 
                     if all_done and len(sent_indices) >= len(
                         [m for m in new_messages if m.get("info", {}).get("role") == "assistant"]
                     ):
-                        print(f"✅ Progressive push done: {elapsed}s, {len(sent_indices)} parts sent")
                         return
 
-                except Exception as e:
-                    print(f"⚠️ Poll error: {e}")
+                except Exception:
                     continue
 
-            # Timeout — push whatever we haven't sent yet
-            try:
-                resp = await client.get(f"{server_url}/session/{session_id}/message")
-                if resp.status_code == 200:
-                    messages = resp.json()
-                    new_messages = messages[pre_count:]
-                    for idx, msg in enumerate(new_messages):
-                        if idx in sent_indices:
-                            continue
-                        if msg.get("info", {}).get("role") != "assistant":
-                            continue
-                        for part in msg.get("parts", []):
-                            if part.get("type") == "text" and part.get("text"):
-                                for chunk in split_message(part["text"]):
-                                    await self._reply(chat_id, chunk)
-                        sent_indices.add(idx)
-            except Exception:
-                pass
-
-            if not sent_indices:
-                await self._reply(chat_id, "⏱️ OpenCode 响应超时，未收到回复。")
+            # Timeout — final fetch
+            await self._final_fetch(client, server_url, session_id, chat_id)
 
         except httpx.TimeoutException:
             await self._reply(chat_id, "⏱️ OpenCode 响应超时。任务可能仍在运行。")
         except Exception as e:
-            print(f"⚠️ Progressive push error: {e}")
             await self._reply(chat_id, f"❌ 错误: {e}")
         finally:
             await client.aclose()
+
+    async def _final_fetch(
+        self, client: httpx.AsyncClient, server_url: str,
+        session_id: str, chat_id: str,
+    ) -> None:
+        """Fetch remaining completed messages from OpenCode after SSE/poll ends."""
+        try:
+            resp = await client.get(f"{server_url}/session/{session_id}/message")
+            if resp.status_code != 200:
+                return
+            messages = resp.json()
+            for msg in messages:
+                info = msg.get("info", {})
+                if info.get("role") != "assistant":
+                    continue
+                for part in msg.get("parts", []):
+                    if part.get("type") == "text" and part.get("text"):
+                        for chunk in split_message(part["text"]):
+                            await self._reply(chat_id, chunk)
+        except Exception:
+            pass
 
     # ── Reply helper ──────────────────────────────────────────────────
     async def _reply(self, chat_id: str, text: str) -> Optional[str]:
@@ -570,6 +709,9 @@ class LansengerBot:
         - ≤ 6000 chars: send as text or formatText (Markdown) message
         - > 6000 chars: write to temp .md file and send as file attachment
         """
+        # Log outbound message
+        self._log_message(chat_id, "outbound", text, "bot")
+
         if len(text) > 6000:
             return await self._reply_as_file(chat_id, text)
 
@@ -589,7 +731,6 @@ class LansengerBot:
             result = await self._http_client.send_file(
                 chat_id, filepath, content=f"📄 响应内容过长({len(text)}字)，已生成文件"
             )
-            # Cleanup temp file
             try:
                 os.unlink(filepath)
                 os.rmdir(tmp_dir)
@@ -598,6 +739,39 @@ class LansengerBot:
             return result
         except Exception as e:
             print(f"[Lansenger] _reply_as_file error: {e}")
-            # Fallback: send truncated text
             truncated = text[:5900] + "\n\n... (内容过长，已截断)"
             return await self._http_client.send_format_text(chat_id, truncated)
+
+    # ── Conversation logging ──────────────────────────────────────────
+    def _log_message(self, chat_id: str, direction: str, content: str, msg_type: str = "text") -> None:
+        """Append a message to the conversation log file.
+
+        Each chat_id gets a daily JSON file:
+        ~/.opencode-lansenger-remote/conversations/{date}_{chat_id}.json
+
+        Each entry: {ts, direction, type, content}
+        """
+        try:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            short_id = chat_id.split("-")[-1] if "-" in chat_id else chat_id
+            log_file = self._log_dir / f"{date_str}_{short_id}.json"
+
+            entry = {
+                "ts": datetime.now().isoformat(),
+                "direction": direction,
+                "type": msg_type,
+                "content": content,
+            }
+
+            # Append to existing or create new
+            entries = []
+            if log_file.exists():
+                try:
+                    entries = json.loads(log_file.read_text(encoding="utf-8"))
+                except Exception:
+                    entries = []
+
+            entries.append(entry)
+            log_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[Lansenger] Log error: {e}")
