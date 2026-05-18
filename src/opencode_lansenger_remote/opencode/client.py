@@ -188,6 +188,21 @@ class OpenCodeClient:
             return await self._probe_http()
         return bool(self._opencode_path)
 
+    async def reconnect(self) -> bool:
+        """Re-probe OpenCode server: refresh port, auth, and availability."""
+        # Re-read auth from env vars (OpenCode desktop may have restarted with new password)
+        pw = os.getenv("OPENCODE_SERVER_PASSWORD", "")
+        if pw:
+            self._server_auth = httpx.BasicAuth(
+                os.getenv("OPENCODE_SERVER_USERNAME", "opencode"), pw
+            )
+        self._http_available = await self._probe_http()
+        if self._http_available:
+            print(f"✅ Reconnected: {self._server_url}")
+        else:
+            print("❌ OpenCode server not found after reconnect")
+        return self._http_available
+
     async def create_session(
         self,
         thread_id: str,

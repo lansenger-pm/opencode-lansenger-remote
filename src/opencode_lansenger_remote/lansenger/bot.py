@@ -257,6 +257,7 @@ class LansengerBot:
             "/files": self._cmd_files,
             "/reset": self._cmd_reset,
             "/retry": self._cmd_retry,
+            "/reconnect": self._cmd_reconnect,
             "/project": self._cmd_project,
             "/projects": self._cmd_projects,
             "/cd": self._cmd_cd,
@@ -298,6 +299,7 @@ class LansengerBot:
 /diff — 查看变更详情
 /files — 列出变更文件
 /retry — 重试 OpenCode 连接
+/reconnect — 重连（桌面版重启后用这个刷新端口和密码）
 
 💬 其他文本作为 prompt 发送给 OpenCode！""")
 
@@ -359,6 +361,16 @@ class LansengerBot:
             await self._reply(ctx.thread_id, "✅ OpenCode 已上线！")
         else:
             await self._reply(ctx.thread_id, "❌ 仍然离线。请确认 OpenCode 是否在运行。")
+
+    async def _cmd_reconnect(self, ctx: MessageContext, session: Any, raw_text: str = "") -> None:
+        """Re-probe OpenCode server (refresh port + password after desktop restart)."""
+        await self._reply(ctx.thread_id, "🔄 正在重新连接...")
+        connected = await self._opencode.reconnect()
+        if connected:
+            url = self._opencode._server_url
+            await self._reply(ctx.thread_id, f"✅ 已重连 OpenCode\n\n🔗 `{url}`\n\n💡 可以继续对话了。")
+        else:
+            await self._reply(ctx.thread_id, "❌ 重连失败\n\n请确认 OpenCode 桌面版已打开，然后再试 `/reconnect`。")
 
     async def _cmd_project(self, ctx: MessageContext, session: Any, raw_text: str = "") -> None:
         """Show current project info (via HTTP or CLI)."""
