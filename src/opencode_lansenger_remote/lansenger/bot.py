@@ -509,6 +509,7 @@ class LansengerBot:
         error_msg: Optional[str] = None
 
         async def on_sse_line(line: str) -> None:
+            nonlocal last_msg_id, error_msg
             if not line.startswith("data:"):
                 return
             raw = line[5:].strip()
