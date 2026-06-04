@@ -14,7 +14,7 @@ from typing import Optional, Any
 import httpx
 
 from ..core.types import Config, MessageContext, EMOJI
-from ..core.session import get_or_create_session, init_session_manager
+from ..core.session import get_or_create_session, init_session_manager, shutdown_session_manager
 from ..core.auth import isAuthorized, has_owner, claim_ownership, get_owner
 from ..core.approval import (
     create_approval_request,
@@ -51,6 +51,7 @@ class LansengerBot:
         self._opencode = OpenCodeClient(config)
         self._opencode_sessions: dict[str, Any] = {}
         self._ws: Optional[LansengerWS] = None
+        self._stop_event = asyncio.Event()
 
         # Dedup dict for inbound messages (ordered, keeps insertion order for truncation)
         self._seen_msg_ids: dict[str, bool] = {}
@@ -108,18 +109,16 @@ class LansengerBot:
         print("\n🚀 蓝信机器人已启动 🌠")
         print("   在蓝信中发送消息即可控制 OpenCode")
 
-        # Wait forever (or until SIGINT)
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            await self.stop()
+        # Wait forever (or until stop())
+        await self._stop_event.wait()
 
     async def stop(self) -> None:
         """Stop everything."""
         print("\n🛑 正在关闭...")
+        self._stop_event.set()
         if self._ws:
             await self._ws.stop()
+        await shutdown_session_manager()
         await self._http_client.close()
         await self._opencode.close()
         print("已关闭")

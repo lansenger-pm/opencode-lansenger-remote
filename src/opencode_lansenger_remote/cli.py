@@ -31,13 +31,18 @@ def main() -> None:
 
     bot = LansengerBot(config)
 
-    # Handle graceful shutdown
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    shutdown_requested = False
+
     def shutdown_handler():
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
         print("\n🛑 Received shutdown signal...")
-        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(bot.stop()))
+        loop.call_soon_threadsafe(lambda: bot._stop_event.set())
 
     signal.signal(signal.SIGINT, lambda *_: shutdown_handler())
     signal.signal(signal.SIGTERM, lambda *_: shutdown_handler())
@@ -45,8 +50,9 @@ def main() -> None:
     try:
         loop.run_until_complete(bot.start())
     except KeyboardInterrupt:
-        loop.run_until_complete(bot.stop())
+        bot._stop_event.set()
     finally:
+        loop.run_until_complete(bot.stop())
         loop.close()
 
 

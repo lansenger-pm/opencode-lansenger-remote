@@ -35,6 +35,18 @@ async def _cleanup_loop(config: Config) -> None:
             print(f"Session expired: {tid}")
 
 
+async def shutdown_session_manager() -> None:
+    """Cancel the cleanup task for graceful shutdown."""
+    global _cleanup_task
+    if _cleanup_task:
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+        _cleanup_task = None
+
+
 def get_or_create_session(thread_id: str, platform: str = "lansenger") -> Session:
     """Return existing session (touching lastActivity) or create new one."""
     existing = _sessions.get(thread_id)
@@ -42,49 +54,16 @@ def get_or_create_session(thread_id: str, platform: str = "lansenger") -> Sessio
         existing.last_activity = time.time() * 1000
         return existing
 
-    now = time.time() * 1000
     session = Session(
         id=str(uuid.uuid4()),
-        thread_id=thread_id,
         platform=platform,
-        created_at=now,
-        last_activity=now,
+        thread_id=thread_id,
+        last_activity=time.time() * 1000,
     )
     _sessions[thread_id] = session
-    print(f"Session created: {thread_id}")
     return session
 
 
 def get_session(thread_id: str) -> Optional[Session]:
+    """Return session without touching lastActivity."""
     return _sessions.get(thread_id)
-
-
-def update_session(thread_id: str, **kwargs) -> Optional[Session]:
-    session = _sessions.get(thread_id)
-    if not session:
-        return None
-    for k, v in kwargs.items():
-        setattr(session, k, v)
-    session.last_activity = time.time() * 1000
-    return session
-
-
-def delete_session(thread_id: str) -> bool:
-    return _sessions.pop(thread_id, None) is not None
-
-
-def get_all_sessions() -> list[Session]:
-    return list(_sessions.values())
-
-
-def get_session_count() -> int:
-    return len(_sessions)
-
-
-async def stop_session_manager() -> None:
-    if _cleanup_task:
-        _cleanup_task.cancel()
-        try:
-            await _cleanup_task
-        except asyncio.CancelledError:
-            pass

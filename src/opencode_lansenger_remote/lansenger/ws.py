@@ -44,8 +44,16 @@ class LansengerWS:
     async def stop(self) -> None:
         """Stop WebSocket connection."""
         self._running = False
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
         if self._ws_task:
             self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
+            self._ws_task = None
         print("[Lansenger WS] Stopped")
 
     async def _run_ws(self, ws_url: str) -> None:
