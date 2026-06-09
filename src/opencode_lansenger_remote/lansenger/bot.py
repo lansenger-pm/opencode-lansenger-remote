@@ -261,6 +261,7 @@ class LansengerBot:
             "/projects": self._cmd_projects,
             "/cd": self._cmd_cd,
             "/pwd": self._cmd_pwd,
+            "/model": self._cmd_model,
         }
 
         handler = switch.get(command)
@@ -291,6 +292,7 @@ class LansengerBot:
 /project — 查看当前项目信息
 /pwd — 查看当前工作目录
 /cd <路径或编号> — 切换项目目录（如 /cd 1 或 /cd ~/my-project）
+/model <模型名> — 切换 AI 模型（如 /model gpt-4o、/model claude-sonnet）
 /join — 加入桌面版当前 session（消息在桌面版可见）
 /reset — 重置会话（退回独立 session）
 /approve — 批准待审批变更
@@ -443,6 +445,24 @@ class LansengerBot:
         """Show current working directory."""
         cwd = self._opencode.current_workdir()
         await self._reply(ctx.thread_id, f"📁 `{cwd}`")
+
+    async def _cmd_model(self, ctx: MessageContext, session: Any, raw_text: str = "") -> None:
+        """Switch AI model for OpenCode."""
+        args = raw_text.split(maxsplit=1)
+        if len(args) < 2 or not args[1].strip():
+            current = self._config.opencode_model or "（使用 opencode 默认模型）"
+            await self._reply(ctx.thread_id,
+                f"🤖 当前模型: `{current}`\n\n"
+                "用法: `/model <模型名>`\n"
+                "例如: `/model gpt-4o`、`/model claude-sonnet`\n\n"
+                "💡 切换模型后，建议 /reset 重置会话以使新模型生效。")
+            return
+
+        model = args[1].strip()
+        self._config.opencode_model = model
+        await self._reply(ctx.thread_id,
+            f"✅ 已切换模型为: `{model}`\n\n"
+            "💡 建议发送 /reset 重置会话，新对话将使用此模型。")
 
     async def _cmd_join(self, ctx: MessageContext, session: Any, raw_text: str = "") -> None:
         """Join desktop app's current session so messages appear in desktop UI."""

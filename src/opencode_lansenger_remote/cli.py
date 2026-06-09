@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 import signal
@@ -12,7 +13,22 @@ from .lansenger.bot import LansengerBot
 
 def main() -> None:
     """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="通过蓝信个人机器人远程控制 OpenCode",
+    )
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        default=None,
+        help="指定 OpenCode 使用的模型（如 gpt-4、claude-sonnet），覆盖环境变量 OPENCODE_MODEL",
+    )
+    args = parser.parse_args()
+
     config = load_config()
+
+    # CLI argument overrides env var
+    if args.model:
+        config.opencode_model = args.model
 
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("  OpenCode Lansenger Remote 🌠")

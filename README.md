@@ -61,6 +61,7 @@ LANSENGER_API_GATEWAY_URL=https://apigw.lx.qianxin.com
 
 ```ini
 OPENCODE_SERVER_URL=http://localhost:4096   # 默认值，程序会自动探测桌面版
+OPENCODE_MODEL=gpt-4o                        # 指定使用的模型
 SESSION_IDLE_TIMEOUT_MS=1800000             # 30分钟空闲过期
 APPROVAL_TIMEOUT_MS=300000                  # 5分钟审批超时
 ```
@@ -77,6 +78,18 @@ opencode-lansenger
 
 ```bash
 python -m opencode_lansenger_remote
+```
+
+### 命令行参数
+
+| 参数 | 说明 |
+|------|------|
+| `--model`, `-m` | 指定 OpenCode 使用的模型（如 `--model gpt-4o`），覆盖环境变量 `OPENCODE_MODEL` |
+
+示例：
+
+```bash
+opencode-lansenger --model claude-sonnet-4-20250514
 ```
 
 程序启动时会自动：
@@ -99,6 +112,7 @@ python -m opencode_lansenger_remote
 | `/project` | 查看当前项目信息 |
 | `/pwd` | 查看当前工作目录 |
 | `/cd <路径或编号>` | 切换项目目录（如 `/cd 1` 或 `/cd ~/my-project`） |
+| `/model <模型名>` | 切换 AI 模型（如 `/model gpt-4o`），切换后建议 /reset |
 | `/join` | 加入桌面版当前 session（消息在桌面版可见） |
 | `/reset` | 重置会话（退回独立 session） |
 | `/reconnect` | 重连（桌面版重启后刷新端口和密码） |

@@ -76,6 +76,7 @@ class Config:
 
     # OpenCode config
     opencode_server_url: str = "http://localhost:4096"
+    opencode_model: str = ""  # 指定 opencode 使用的模型，如 gpt-4, claude-sonnet 等
 
     # Timeout config
     session_idle_timeout_ms: int = 1800000  # 30 min
@@ -130,6 +131,9 @@ def load_config() -> Config:
     config.request_timeout_minutes = int(
         os.getenv("OPENCODE_REQUEST_TIMEOUT_MINUTES",
                   env_vars.get("OPENCODE_REQUEST_TIMEOUT_MINUTES", "30"))
+    )
+    config.opencode_model = os.getenv(
+        "OPENCODE_MODEL", env_vars.get("OPENCODE_MODEL", "")
     )
 
     return config

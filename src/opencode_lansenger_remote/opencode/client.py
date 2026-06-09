@@ -439,15 +439,17 @@ class OpenCodeClient:
     async def _send_via_cli(self, message: str) -> str:
         """Send prompt via `opencode run` CLI (non-interactive mode).
 
-        Uses -c flag for working directory and positional message argument.
+        Uses -c flag for working directory, optional --model flag, and positional message argument.
         """
         try:
             cmd = [
                 self._opencode_path or "opencode",
                 "run",
                 "-c", self._workdir,
-                message,
             ]
+            if self._config.opencode_model:
+                cmd.extend(["--model", self._config.opencode_model])
+            cmd.append(message)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
