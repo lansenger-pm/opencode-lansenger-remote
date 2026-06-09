@@ -116,12 +116,11 @@ class OpenCodeClient:
             print(f"✅ OpenCode server detected at {self._server_url}")
         else:
             print("ℹ️ OpenCode server not running — will use CLI mode")
-            print("   Tip: run `opencode serve` for better performance (persistent sessions)")
 
         self._verified = True
         self._initialized = True
 
-    async def _probe_http(self) -> bool:
+    async def _probe_http(self, verbose: bool = False) -> bool:
         """Check if OpenCode server is reachable (opencode serve or TUI server)."""
         # Try the configured server URL first
         urls_to_try = [(self._server_url, self._server_auth)]
@@ -131,40 +130,91 @@ class OpenCodeClient:
             urls_to_try.append((desktop_url, desktop_auth))
 
         for url, auth in urls_to_try:
-            try:
-                client = httpx.AsyncClient(timeout=5.0, auth=auth)
+            # Try with auth first, then without
+            auth_options = [auth, None] if auth else [None]
+            for option in auth_options:
+                auth_label = f"opencode:{'***' if option else 'none'}" if option else "none"
                 try:
-                    response = await client.get(f"{url}/global/health")
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get("healthy"):
-                            version = data.get("version", "unknown")
-                            print(f"   Server version: {version}")
-                            # Update server URL/auth if discovered
-                            if url != self._server_url:
-                                self._server_url = url
-                                self._server_auth = auth
-                                print(f"   Discovered server at {url}")
-                            await client.aclose()
-                            return True
-                except Exception:
-                    pass
-                await client.aclose()
-            except Exception:
-                pass
+                    client = httpx.AsyncClient(timeout=5.0, auth=option)
+                    try:
+                        response = await client.get(f"{url}/global/health")
+                        if verbose:
+                            print(f"   Probe {url} (auth={auth_label}): HTTP {response.status_code}")
+                        if response.status_code == 200:
+                            data = response.json()
+                            if data.get("healthy"):
+                                version = data.get("version", "unknown")
+                                print(f"   Server version: {version}")
+                                # Update server URL/auth if discovered
+                                if url != self._server_url:
+                                    self._server_url = url
+                                    self._server_auth = option
+                                    print(f"   Connected to server at {url}")
+                                await client.aclose()
+                                return True
+                    except httpx.ConnectError as e:
+                        if verbose:
+                            print(f"   Probe {url} (auth={auth_label}): connection refused")
+                    except httpx.TimeoutException:
+                        if verbose:
+                            print(f"   Probe {url} (auth={auth_label}): timeout")
+                    except Exception as e:
+                        if verbose:
+                            print(f"   Probe {url} (auth={auth_label}): {type(e).__name__}: {e}")
+                    await client.aclose()
+                except Exception as e:
+                    if verbose:
+                        print(f"   Probe {url} (auth={auth_label}): client error: {type(e).__name__}: {e}")
         return False
 
     def _discover_desktop_server(self) -> tuple[Optional[str], Optional[httpx.BasicAuth]]:
-        """Auto-discover OpenCode desktop app server by scanning known port patterns."""
+        """Auto-discover OpenCode desktop app server URL and auth.
+
+        Tries multiple approaches:
+        1. Parse desktop app log files for 'server ready' URL
+        2. Scan with lsof for OpenCode listening ports
+        """
+        import glob
+        import re
         import subprocess
+
+        # Approach 1: Parse desktop app logs for server URL
+        log_dirs = [
+            os.path.expanduser("~/Library/Application Support/ai.opencode.desktop/logs"),
+        ]
+        for log_base in log_dirs:
+            try:
+                if not os.path.isdir(log_base):
+                    continue
+                # Find most recent main.log
+                log_files = sorted(glob.glob(os.path.join(log_base, "*", "main.log")), reverse=True)
+                for log_path in log_files[:3]:  # Check 3 most recent
+                    try:
+                        with open(log_path, "r") as f:
+                            content = f.read()
+                        # Match: server ready { url: 'http://127.0.0.1:54496' }
+                        m = re.search(r"server ready\s*\{[^}]*url:\s*'([^']+)'", content)
+                        if m:
+                            url = m.group(1)
+                            auth = httpx.BasicAuth(
+                                os.getenv("OPENCODE_SERVER_USERNAME", "opencode"),
+                                os.getenv("OPENCODE_SERVER_PASSWORD", ""),
+                            )
+                            print(f"   Discovered server from logs: {url}")
+                            return url, auth
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # Approach 2: lsof scan
         try:
             result = subprocess.run(
                 ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
                 capture_output=True, text=True, timeout=5,
             )
             for line in result.stdout.splitlines():
-                if "OpenCode" in line and "LISTEN" in line:
-                    # Extract port from line like: ... TCP 127.0.0.1:61864 (LISTEN)
+                if "LISTEN" in line and ("opencode" in line.lower() or "OpenCode" in line):
                     parts = line.split(":")
                     if len(parts) >= 2:
                         port_str = parts[-1].split()[0]
@@ -180,6 +230,7 @@ class OpenCodeClient:
                             pass
         except Exception:
             pass
+
         return None, None
 
     async def check_connection(self) -> bool:
@@ -196,7 +247,7 @@ class OpenCodeClient:
             self._server_auth = httpx.BasicAuth(
                 os.getenv("OPENCODE_SERVER_USERNAME", "opencode"), pw
             )
-        self._http_available = await self._probe_http()
+        self._http_available = await self._probe_http(verbose=True)
         if self._http_available:
             print(f"✅ Reconnected: {self._server_url}")
         else:

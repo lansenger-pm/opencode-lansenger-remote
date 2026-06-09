@@ -94,10 +94,10 @@ opencode-lansenger --model claude-sonnet-4-20250514
 
 程序启动时会自动：
 1. 加载上次记住的项目目录（`~/.opencode-lansenger-remote/workdir.json`）
-2. 探测 OpenCode 桌面版 HTTP server（通过 `lsof` 自动发现端口和认证）
-3. 若桌面版未运行，回退到 CLI 模式
+2. 探测 OpenCode 桌面版 HTTP server（解析日志 + `lsof` 自动发现端口）
+3. 若桌面版 server 不可用（无密码认证），回退到 CLI 模式
 
-**桌面版重启后**，端口和密码会变化，在蓝信中发送 `/reconnect` 刷新连接。
+CLI 模式与桌面版共享同一数据库（`~/.local/share/opencode/opencode.db`），项目列表、会话记录互通，功能完整可用。
 
 ## 命令
 
@@ -115,7 +115,7 @@ opencode-lansenger --model claude-sonnet-4-20250514
 | `/model <模型名>` | 切换 AI 模型（如 `/model gpt-4o`），切换后建议 /reset |
 | `/join` | 加入桌面版当前 session（消息在桌面版可见） |
 | `/reset` | 重置会话（退回独立 session） |
-| `/reconnect` | 重连（桌面版重启后刷新端口和密码） |
+| `/reconnect` | 尝试切换到 HTTP 模式（需桌面版密码） |
 | `/approve` | 批准待审批变更 |
 | `/reject` | 拒绝待审批变更 |
 | `/diff` | 查看变更详情 |

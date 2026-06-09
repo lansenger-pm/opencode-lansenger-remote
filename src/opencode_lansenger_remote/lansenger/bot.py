@@ -369,9 +369,13 @@ class LansengerBot:
         connected = await self._opencode.reconnect()
         if connected:
             url = self._opencode._server_url
-            await self._reply(ctx.thread_id, f"✅ 已重连 OpenCode\n\n🔗 `{url}`\n\n💡 可以继续对话了。")
+            await self._reply(ctx.thread_id, f"✅ 已切换到 HTTP 模式\n\n🔗 `{url}`")
         else:
-            await self._reply(ctx.thread_id, "❌ 重连失败\n\n请确认 OpenCode 桌面版已打开，然后再试 `/reconnect`。")
+            await self._reply(ctx.thread_id,
+                "ℹ️ 未检测到 OpenCode 桌面版 HTTP 服务，继续使用 CLI 模式。\n\n"
+                "CLI 模式与桌面版共享数据库，项目、会话互通，可正常使用。\n"
+                "若需 HTTP 模式，请在启动桌面版后设置环境变量：\n"
+                "`export OPENCODE_SERVER_PASSWORD=<桌面版生成的密码>`")
 
     async def _cmd_project(self, ctx: MessageContext, session: Any, raw_text: str = "") -> None:
         """Show current project info (via HTTP or CLI)."""
